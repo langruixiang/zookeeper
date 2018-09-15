@@ -454,10 +454,10 @@ public class Leader {
             // Start thread that waits for connection requests from
             // new followers.
 
-            // 和folower建立长连接
+            /*
+             * 新建线程, 接受folower的连接请求
+             */
             cnxAcceptor = new LearnerCnxAcceptor();
-
-            // 处理连接到leader请求
             cnxAcceptor.start();
 
             long epoch = getEpochToPropose(self.getId(), self.getAcceptedEpoch());
@@ -517,10 +517,18 @@ public class Leader {
             // us. We do this by waiting for the NEWLEADER packet to get
             // acknowledged
 
+            /*
+             * Recovery Phase实际上进行了两次阻塞等待过程, 此处是第一次
+             * 此次等待过程具体含义请见learnerHandler线程
+             */
             waitForEpochAck(self.getId(), leaderStateSummary);
             self.setCurrentEpoch(epoch);
 
             try {
+                /*
+                 * Recovery Phase的第二次阻塞等待流程,
+                 * 此次等待过程具体含义请见learnerHandler线程
+                 */
                 waitForNewLeaderAck(self.getId(), zk.getZxid());
             } catch (InterruptedException e) {
                 shutdown("Waiting for a quorum of followers, only synced with sids: [ "
@@ -585,7 +593,9 @@ public class Leader {
             // If not null then shutdown this leader
             String shutdownMessage = null;
 
-            // leader主循环 周期性发送心跳
+            /*
+             * leader主线程的主循环
+             */
             while (true) {
                 synchronized (this) {
                     long start = Time.currentElapsedTime();
@@ -636,8 +646,15 @@ public class Leader {
                     }
                     tickSkip = !tickSkip;
                 }
+                /*
+                 * leader周期性的ping各个folower,
+                 * 每次ping, leader会syncLimitCheck.check检查当前folower是否有超时的Proposol还未ACK,
+                 * 如果有则主动终止learnerHandler线程
+                 *
+                 * folower在收到leader的PING消息后, 会把自己的global session信息发送至leader, 用于session消息的同步,
+                 * 客户端也会则是周期性的PING自己所连的folower或leader, 避免session信息的过期
+                 */
                 for (LearnerHandler f : getLearners()) {
-                    // 发送ping命令，本质就是检测leader与learner是否有proposal超时了(超过指定时长没有收到ack)
                     f.ping();
                 }
             }

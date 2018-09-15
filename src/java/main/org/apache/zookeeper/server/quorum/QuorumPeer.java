@@ -1108,6 +1108,9 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
              */
             while (running) {
                 switch (getPeerState()) {
+                    /*
+                     * 节点刚启动时, 处于looking状态
+                     */
                     case LOOKING:
                         LOG.info("LOOKING");
 
@@ -1147,7 +1150,12 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                                     startLeaderElection();
                                 }
 
-                                // lookForLeader返回时, state会变为leading或following
+                                /*
+                                 * lookForLeader实现了FLE的主要逻辑,
+                                 * lookForLeader返回时, state会变为leading或following
+                                 * 进而转入到Main Loop的其他case中
+                                 * lookForleader函数的返回标志着FLE阶段的结束, 开始进入Recovery Phase阶段
+                                 */
                                 setCurrentVote(makeLEStrategy().lookForLeader());
                             } catch (Exception e) {
                                 LOG.warn("Unexpected exception", e);
@@ -1186,6 +1194,9 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                         }
                         break;
                     case FOLLOWING:
+                        /*
+                         * lookForLeader返回为FOLOWING时,运行此处逻辑
+                         */
                         try {
                             LOG.info("FOLLOWING");
                             setFollower(makeFollower(logFactory));
@@ -1201,6 +1212,9 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                         }
                         break;
                     case LEADING:
+                        /*
+                         * lookForLeader返回为FOLOWING时,运行此处逻辑
+                         */
                         LOG.info("LEADING");
                         try {
                             setLeader(makeLeader(logFactory));

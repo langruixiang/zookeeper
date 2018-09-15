@@ -373,10 +373,14 @@ public class LearnerHandler extends ZooKeeperThread {
     public void run() {
         try {
             /*
-             * LearnerHandler为与某一个folower建立的通信链路
+             * leader与folower建立连接后, 新建一个LearnerHandler线程与folower通信
              */
 
-            // 把自己加入leader维护的learnerHandler列表中, leader周期性的ping各follower, 自己则处理folower发送的各种类型请求
+            /*
+             * 把自己加入leader维护的learnerHandler列表中,
+             * leader主线程会周期性的ping各folower, 在ping的过程中检查folower是否超时,
+             * 详见leader的主线程
+             */
             leader.addLearnerHandler(this);
             tickOfNextAckDeadline = leader.self.tick.get()
                     + leader.self.initLimit + leader.self.syncLimit;
@@ -388,7 +392,11 @@ public class LearnerHandler extends ZooKeeperThread {
             QuorumPacket qp = new QuorumPacket();
             ia.readRecord(qp, "packet");
 
-            // 与folower建立连接后一个包, 接收folower last zxid
+            /*
+             * 与folower建立连接后, folower首先发送FOLOWERINFO消息,
+             * 消息内包含folower的lastZxid, 用于生成新的epoch
+             * 此处folower的lastZxid并不是用于决定数据同步类型的
+             */
             if (qp.getType() != Leader.FOLLOWERINFO && qp.getType() != Leader.OBSERVERINFO) {
                 LOG.error("First packet " + qp.toString()
                         + " is not FOLLOWERINFO or OBSERVERINFO!");
@@ -431,8 +439,14 @@ public class LearnerHandler extends ZooKeeperThread {
             StateSummary ss = null;
             long zxid = qp.getZxid();
 
-            // 生成新的Epoch
+            /*
+             * leader生成新的epoch, 新的epoch = max{多于半数folower的epoch} + 1
+             */
             long newEpoch = leader.getEpochToPropose(this.getSid(), lastAcceptedEpoch);
+
+            /*
+             * 生成新的lastZxid
+             */
             long newLeaderZxid = ZxidUtils.makeZxid(newEpoch, 0);
 
             if (this.getVersion() < 0x10000) {
@@ -445,15 +459,16 @@ public class LearnerHandler extends ZooKeeperThread {
                 byte ver[] = new byte[4];
                 ByteBuffer.wrap(ver).putInt(0x10000);
                 /*
-                 * 发送leader信息
+                 * 发送LEADERINFO信息, 包含自己的lastZxid
                  */
                 QuorumPacket newEpochPacket = new QuorumPacket(Leader.LEADERINFO, newLeaderZxid, ver, null);
                 oa.writeRecord(newEpochPacket, "packet");
                 bufferedOutput.flush();
                 QuorumPacket ackEpochPacket = new QuorumPacket();
 
+
                 /*
-                 * 接收folwer回复
+                 * folower收到LEADERINFO响应消息为ACKEPOCH消息
                  */
                 ia.readRecord(ackEpochPacket, "packet");
                 if (ackEpochPacket.getType() != Leader.ACKEPOCH) {
@@ -465,24 +480,31 @@ public class LearnerHandler extends ZooKeeperThread {
                 ss = new StateSummary(bbepoch.getInt(), ackEpochPacket.getZxid());
 
                 /*
-                 * 等待Epoch信息的ACK: 阻塞至过半数folower回复, 握手阶段完成
+                 * 阻塞等待过半数的folower返回ACKEPOCH消息
                  */
                 leader.waitForEpochAck(this.getSid(), ss);
             }
 
             /*
-             * folwer last Zxid
+             * 获取folower的lastZxid, 此处的lastZxid用于决定数据的同步类型
              */
             peerLastZxid = ss.getLastZxid();
 
             // Take any necessary action if we need to send TRUNC or DIFF
             // startForwarding() will be called in all cases
+
             /*
-             * 与folwer数据不同, 如果需要发送snapshot, 则什么都不做, 返回true
+             * syncFolower用于数据同步:
+             * 1. 如果是DIFF和TRUNC类型的数据同步, 则数据同步过程在syncFolower内部做掉, 并返回false
+             * 2. 如果是SNAP类型的数据同步, 则在syncFolower外部做, syncFolower会返回true
              */
             boolean needSnap = syncFollower(peerLastZxid, leader.zk.getZKDatabase(), leader);
 
             /* if we are not truncating or sending a diff just send a snapshot */
+
+            /*
+             * 处理SNAP类型的数据同步
+             */
             if (needSnap) {
                 boolean exemptFromThrottle = getLearnerType() != LearnerType.OBSERVER;
                 LearnerSnapshot snapshot =
@@ -515,7 +537,7 @@ public class LearnerHandler extends ZooKeeperThread {
             // we got here, so the version was set
 
             /*
-             * NEWLEADER packet是数据同步的最后一个包??
+             * folower数据同步完成后发送NEWLEADER消息包, 标志着自己数据同步的完成
              */
             if (getVersion() < 0x10000) {
                 QuorumPacket newLeaderQP = new QuorumPacket(Leader.NEWLEADER,
@@ -531,7 +553,9 @@ public class LearnerHandler extends ZooKeeperThread {
 
             // Start thread that blast packets in the queue to learner
 
-            // 开始发送上边cache的数据, 进行数据同步
+            /*
+             * DIFF和TRUNC的数据同步只是把数据放在了Queue里边, 这里真正的发送packet
+             */
             startSendingPackets();
 
             /*
@@ -551,13 +575,21 @@ public class LearnerHandler extends ZooKeeperThread {
                 LOG.debug("Received NEWLEADER-ACK message from " + sid);
             }
             /*
-             * 大部分folower同步完成
+             * 阻塞等待至大部分的folower完成数据同步
              */
             leader.waitForNewLeaderAck(getSid(), qp.getZxid());
 
+            /*
+             * syncLimitCheck线程用于leader检查folower的Proposol是否在超时范围内发送了ACK
+             * 如果没有, leader会主动关闭与该folower的learnerHandler线程, 并认为该节点宕机
+             * 此处只是启动了检查的线程, 真正的减产在leader的主线程周期性发ping的时候做, 详见leader主线程
+             */
             syncLimitCheck.start();
 
             // now that the ack has been processed expect the syncLimit
+            /*
+             * leader与folower长连接的超时时间, 超时断开, folower返回looking状态
+             */
             sock.setSoTimeout(leader.self.tickTime * leader.self.syncLimit);
 
             /*
@@ -573,8 +605,16 @@ public class LearnerHandler extends ZooKeeperThread {
             // using the data
             //
             LOG.debug("Sending UPTODATE message to " + sid);
+
+            /*
+             * 发送UPTODATE包, 告诉folower你数据已经和leader一样新了
+             * folower在收到UPTODATE包后, 事实上只是打印了一条日志, 并没有额外响应
+             */
             queuedPackets.add(new QuorumPacket(Leader.UPTODATE, -1, null, null));
 
+            /*
+             * 数据同步完成, 进入broadcast阶段
+             */
             while (true) {
                 qp = new QuorumPacket();
                 ia.readRecord(qp, "packet");

@@ -72,16 +72,21 @@ public class Follower extends Learner {
         self.end_fle = 0;
         fzk.registerJMX(new FollowerBean(this, zk), self.jmxLocalPeerBean);
         try {
+            /*
+             * 从票箱信息里找到leader信息
+             */
             QuorumServer leaderServer = findLeader();
             try {
                 /*
-                 * 和leader建立长连接, 具体通信由Learner.java实现
-                 *  leaderIs, leaderOs为io通道, QuorumPacket为通信包
+                 * 和leader建立长连接, leader会新建一个learnerHandler线程与当前folower通信
+                 * 具体通信由Learner.java实现,leaderIs, leaderOs为io通道, QuorumPacket为通信包
                  */
                 connectToLeader(leaderServer.addr, leaderServer.hostname);
 
                 /*
-                 * 建立连接后的握手: 自己发送flowerInfo, 接收LeaderInfo, 并回复ACKEPOCH
+                 * registerWithLeader完成建立连接后的握手
+                 * 1. folower首先发送FOLOWERINFO消息
+                 * 2. 接收leader的LEADERINFO, 并发挥ACKEPOCH消息
                  */
                 long newEpochZxid = registerWithLeader(Leader.FOLLOWERINFO);
                 if (self.isReconfigStateChange())
@@ -96,13 +101,15 @@ public class Follower extends Learner {
                 }
 
                 /*
-                 * folower历史记录与leader同步
+                 * folower与leader数据同步,
+                 * 1. syncWithLeader函数内部处理了返回NEWLEADER信息的逻辑
+                 * 2. syncWithLeader收到leader的UPTODATE返回
                  */
                 syncWithLeader(newEpochZxid);
                 QuorumPacket qp = new QuorumPacket();
 
                 /*
-                 * folower主循环
+                 * folower主循环: 标志Recovery Phase结束, 进入Brocast Phase
                  */
                 while (this.isRunning()) {
                     readPacket(qp);
