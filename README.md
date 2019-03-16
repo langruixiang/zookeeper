@@ -1,4 +1,4 @@
-# 核心流程添加中文注释 可参考 https://niceaz.com/2018/11/03/raft-and-zab/ Zab部分伪代码详解
+# 核心流程添加中文注释 可参考 https://niceaz.com/2018/11/03/raft-and-zab/ 
 
 
 
