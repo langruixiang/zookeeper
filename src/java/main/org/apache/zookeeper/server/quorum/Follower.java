@@ -18,6 +18,9 @@
 
 package org.apache.zookeeper.server.quorum;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
 import org.apache.jute.Record;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.common.Time;
@@ -28,9 +31,6 @@ import org.apache.zookeeper.server.util.SerializeUtils;
 import org.apache.zookeeper.server.util.ZxidUtils;
 import org.apache.zookeeper.txn.SetDataTxn;
 import org.apache.zookeeper.txn.TxnHeader;
-
-import java.io.IOException;
-import java.nio.ByteBuffer;
 
 /**
  * This class has the control logic for the Follower.
@@ -87,6 +87,7 @@ public class Follower extends Learner {
                  * registerWithLeader完成建立连接后的握手
                  * 1. folower首先发送FOLOWERINFO消息
                  * 2. 接收leader的LEADERINFO, 并发挥ACKEPOCH消息
+                 * 3. 这个函数发送的ACKEPOCH消息中包含的是folower自身的lastZxid, 返回的是新epoch内起始zxid
                  */
                 long newEpochZxid = registerWithLeader(Leader.FOLLOWERINFO);
                 if (self.isReconfigStateChange())

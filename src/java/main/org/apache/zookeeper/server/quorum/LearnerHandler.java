@@ -18,6 +18,23 @@
 
 package org.apache.zookeeper.server.quorum;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.util.Iterator;
+import java.util.Queue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
+
+import javax.security.sasl.SaslException;
+
 import org.apache.jute.BinaryInputArchive;
 import org.apache.jute.BinaryOutputArchive;
 import org.apache.zookeeper.KeeperException.SessionExpiredException;
@@ -34,22 +51,6 @@ import org.apache.zookeeper.server.util.ZxidUtils;
 import org.apache.zookeeper.txn.TxnHeader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import javax.security.sasl.SaslException;
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.net.Socket;
-import java.nio.ByteBuffer;
-import java.util.Iterator;
-import java.util.Queue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 
 /**
  * There will be an instance of this class created by the Leader for each
@@ -782,12 +783,21 @@ public class LearnerHandler extends ZooKeeperThread {
         boolean needSnap = true;
         boolean txnLogSyncEnabled = db.isTxnLogSyncEnabled();
         ReentrantReadWriteLock lock = db.getLogLock();
+
+        /*
+         * 这里需要获取db的读锁, 分两种情况讨论这个读锁的利弊:
+         * 1. 就是在选举刚完成, 处于Recovery Phase, Brocast Phase还没开始, 这种情况, 这个读锁是没有太大的弊端的
+         * 2. 已经处于Boradcast Phase, 某个宕机的folower突然恢复, 加入集群, 恢复数据, 这时,
+         * 这个读锁会导致leader暂时无法处理更新请求
+         */
         ReadLock rl = lock.readLock();
         try {
             rl.lock();
 
             /*
-             * max min ??
+             * maxCommittedLog: 内存中包含的最大committed log的zxid
+             * minCommittedLog: 内存中包含的最新的committed log的zxid
+             * lastProcessedZxid: leader接收的最新的log的zxid, 该log可能没有commit
              */
             long maxCommittedLog = db.getmaxCommittedLog();
             long minCommittedLog = db.getminCommittedLog();
@@ -832,11 +842,16 @@ public class LearnerHandler extends ZooKeeperThread {
              *    we will send snapshot
              */
 
-            // 测试用
+            /*
+             * 测试用
+             */
             if (forceSnapSync) {
                 // Force leader to use snapshot to sync with follower
                 LOG.warn("Forcing snapshot sync - should not see this in production");
-                // 已经同步, 发送空diff包
+                /*
+                 * folower的lastZxid和leader的lasrProcessedZxid相同, 说明folower和leader数据完全一致,
+                 * (包括那个还没commit的log都是一致的), 发送空DIFF
+                 */
             } else if (lastProcessedZxid == peerLastZxid) {
                 // Follower is already sync with us, send empty diff
                 LOG.info("Sending DIFF zxid=0x" + Long.toHexString(peerLastZxid) +
@@ -844,7 +859,12 @@ public class LearnerHandler extends ZooKeeperThread {
                 queueOpPacket(Leader.DIFF, peerLastZxid);
                 needOpPacket = false;
                 needSnap = false;
-                // folower的txn大于leader
+                /*
+                 * folower的lastZxid比leader已经提交的最大log的zxid还大, 发送TRUNC包和maxCommittedLog给folower
+                 * isPeerNewEpochZxid这个flag是一种特殊case的处理:
+                 * 1. 正常流程中, isPeerNewEpochZxid一定是false
+                 * 2. 如果某个folower完成同步后挂了重启又进行数据同步, isPeerNewEpochZxid会变成true, 对这种case进行特殊处理
+                 */
             } else if (peerLastZxid > maxCommittedLog && !isPeerNewEpochZxid) {
                 // Newer than committedLog, send trunc and done
                 LOG.debug("Sending TRUNC to follower zxidToSend=0x" +
@@ -854,7 +874,9 @@ public class LearnerHandler extends ZooKeeperThread {
                 currentZxid = maxCommittedLog;
                 needOpPacket = false;
                 needSnap = false;
-                // folower在内存log范围内
+                /*
+                 * folower的lastZxid在leader的内存记录中
+                 */
             } else if ((maxCommittedLog >= peerLastZxid)
                     && (minCommittedLog <= peerLastZxid)) {
                 // Follower is within commitLog range
@@ -866,25 +888,51 @@ public class LearnerHandler extends ZooKeeperThread {
                 currentZxid = queueCommittedProposals(itr, peerLastZxid,
                         null, maxCommittedLog);
                 needSnap = false;
-                // 需要读硬盘数据
+                /*
+                 * folower的lastZxid在内存中已经找不到
+                 */
             } else if (peerLastZxid < minCommittedLog && txnLogSyncEnabled) {
                 // Use txnlog and committedLog to sync
 
                 // Calculate sizeLimit that we allow to retrieve txnlog from disk
+
+                /*
+                 * 用户可以配置阈值, 超过这个阈值则直接发送snap进行同步, 低于这个阈值则从snap读取Proposol进行同步
+                 * 阈值默认是snap总大小的0.33
+                 */
                 long sizeLimit = db.calculateTxnLogSizeLimit();
                 // This method can return empty iterator if the requested zxid
                 // is older than on-disk txnlog
 
-                // TODO: 此处返回结果决定了是否发送快照
+                /*
+                 * getProposalsFromTxnLog如果返回
+                 * 1. 空迭代器, 代表snap同步机制
+                 * 2. 非空迭代器, 则类似组个发送Proposal和Commit
+                 * 3. sizelimit为负数则代表全部采用snap同步机制
+                 */
                 Iterator<Proposal> txnLogItr = db.getProposalsFromTxnLog(
                         peerLastZxid, sizeLimit);
                 if (txnLogItr.hasNext()) {
                     LOG.info("Use txnlog and committedLog for peer sid: " + getSid());
+
+                    /*
+                     * 分两步分别发送所有的Proposql, 为什么分两步?
+                     * 1. (peerLastZxid, minCommittedLog]区间的Proposal在硬盘中
+                     * 2. minCommitedLog之后所有的Proposal在内存中
+                     */
+
+                    /*
+                     * 发送(peerLastZxid, minCommittedLog]这个区间的Proposal
+                     */
                     currentZxid = queueCommittedProposals(txnLogItr, peerLastZxid,
                             minCommittedLog, maxCommittedLog);
 
                     LOG.debug("Queueing committedLog 0x" + Long.toHexString(currentZxid));
                     Iterator<Proposal> committedLogItr = db.getCommittedLog().iterator();
+
+                    /*
+                     * 发送minCommitedLog之后所有的Proposql
+                     */
                     currentZxid = queueCommittedProposals(committedLogItr, currentZxid,
                             null, maxCommittedLog);
                     needSnap = false;
@@ -919,6 +967,9 @@ public class LearnerHandler extends ZooKeeperThread {
             needSnap = true;
         }
 
+        /*
+         * needSnap返回值默认为true
+         */
         return needSnap;
     }
 

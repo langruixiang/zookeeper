@@ -1184,6 +1184,10 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                         try {
                             LOG.info("OBSERVING");
                             setObserver(makeObserver(logFactory));
+
+                            /*
+                             * observer主逻辑
+                             */
                             observer.observeLeader();
                         } catch (Exception e) {
                             LOG.warn("Unexpected exception", e);
@@ -1218,6 +1222,9 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                         LOG.info("LEADING");
                         try {
                             setLeader(makeLeader(logFactory));
+                            /*
+                             * leader主逻辑
+                             */
                             leader.lead();
                             setLeader(null);
                         } catch (Exception e) {

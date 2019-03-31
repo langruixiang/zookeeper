@@ -364,6 +364,12 @@ public class Learner {
      */
     protected void syncWithLeader(long newLeaderZxid) throws Exception {
 
+        /*
+         * 这个ack包用于ACK NEWLEADER信息, 表示数据同步过程的完成
+         * 讲道理, 这个东西应该出现在函数的末尾, 不应该出现在这个位置, 但是仔细看才发现,
+         * 这个包只收在这里new出来了, 发送逻辑是在同步完成后发的.......
+         */
+
         QuorumPacket ack = new QuorumPacket(Leader.ACK, 0, null, null);
         QuorumPacket qp = new QuorumPacket();
         long newEpoch = ZxidUtils.getEpochFromZxid(newLeaderZxid);
@@ -374,13 +380,24 @@ public class Learner {
         // For SNAP and TRUNC the snapshot is needed to save that history
         boolean snapshotNeeded = true;
         boolean syncSnapshot = false;
+
+        /*
+         * 读取leader发送的OpPacker, 决定数据同步的类型
+         */
         readPacket(qp);
         LinkedList<Long> packetsCommitted = new LinkedList<Long>();
         LinkedList<PacketInFlight> packetsNotCommitted = new LinkedList<PacketInFlight>();
         synchronized (zk) {
+            /*
+             * DIFF类型数据同步
+             */
             if (qp.getType() == Leader.DIFF) {
                 LOG.info("Getting a diff from the leader 0x{}", Long.toHexString(qp.getZxid()));
                 snapshotNeeded = false;
+
+                /*
+                 * SNAP类型数据同步, 直接从leaderIs读取snap文件发反序列化
+                 */
             } else if (qp.getType() == Leader.SNAP) {
                 LOG.info("Getting a snapshot from leader 0x" + Long.toHexString(qp.getZxid()));
                 // The leader is going to dump the database
@@ -402,6 +419,10 @@ public class Learner {
 
                 // immediately persist the latest snapshot when there is txn log gap
                 syncSnapshot = true;
+
+                /*
+                 * TRUNC类型数据同步, 丢弃本地SNAP部分数据, 在把SNAP反序列化到内存中
+                 */
             } else if (qp.getType() == Leader.TRUNC) {
                 //we need to truncate the log to the lastzxid of the leader
                 LOG.warn("Truncating log to get in sync with the leader 0x"
@@ -435,9 +456,16 @@ public class Learner {
             boolean writeToTxnLog = !snapshotNeeded;
             // we are now going to start getting transactions to apply followed by an UPTODATE
             outerLoop:
+
+            /*
+             * DIFF类型数据同步, 处理具体的Proposal队列
+             */
             while (self.isRunning()) {
                 readPacket(qp);
                 switch (qp.getType()) {
+                    /*
+                     * 接收leader发送的Proposal包, 放入packetsNotCommitted队列中
+                     */
                     case Leader.PROPOSAL:
                         PacketInFlight pif = new PacketInFlight();
                         pif.hdr = new TxnHeader();
@@ -458,6 +486,10 @@ public class Learner {
 
                         packetsNotCommitted.add(pif);
                         break;
+
+                    /*
+                     * 处理COMMIT消息包, COMMITANDACTIVATE用于reconfig
+                     */
                     case Leader.COMMIT:
                     case Leader.COMMITANDACTIVATE:
                         pif = packetsNotCommitted.peekFirst();
@@ -480,6 +512,11 @@ public class Learner {
                             packetsCommitted.add(qp.getZxid());
                         }
                         break;
+                    /*
+                     * Observer的数据同步, Observer不需要走Proposal->Commit这个过程, 直接收到一个Commited的Proposal
+                     * INFORMANDACTIVATE用于reconfig
+                     * 但是最新版本folower和observer的数据同步流程是一致的, 已经不在会运行到这个case
+                     */
                     case Leader.INFORM:
                     case Leader.INFORMANDACTIVATE:
                         PacketInFlight packet = new PacketInFlight();
@@ -517,6 +554,10 @@ public class Learner {
                         }
 
                         break;
+                    /*
+                     * 数据同步的最后一个包, 表示当前数据已经是最新的了, Folower收到这个消息报跳出循环
+                     * 发送ACK NEWLEADER包
+                     */
                     case Leader.UPTODATE:
                         LOG.info("Learner received UPTODATE message");
                         if (newLeaderQV != null) {
@@ -533,6 +574,9 @@ public class Learner {
                         self.setZooKeeperServer(zk);
                         self.adminServer.setZooKeeperServer(zk);
                         break outerLoop;
+                    /*
+                     * 1.0在这里处理NEWLEADR消息, 我们忽略这个case
+                     */
                     case Leader.NEWLEADER: // Getting NEWLEADER here instead of in discovery
                         // means this is Zab 1.0
                         LOG.info("Learner received NEWLEADER message");
